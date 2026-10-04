@@ -1257,6 +1257,198 @@ static void mode_morsecode(void) {
 }
 static const char _data_FX_MODE_MORSECODE[] PROGMEM = "Morse Code@Speed,,,,Color mode,Color by Word,Punctuation,EndOfMessage;;!;1;sx=192,c3=8,o1=1,o2=1";
 
+// Fold / Ignite: one-shot "lightsaber" fill that grows to a target % and then HOLDS.
+// Built for the cove "pyramid" bars (one segment per bar): set each segment's intensity to its
+// blade height and the bars fold open together, deepest bars finishing last.
+//   speed     : grow rate            intensity : fill target (% of segment, 0..100)
+//   check1    : grow from far end (top) instead of index 0 (bottom)
+//   check2    : solid primary colour instead of palette
+//   check3    : re-trigger -- flip this checkbox to re-ignite from any state
+// Re-ignites on a fresh effect init (call==0) or whenever the re-trigger checkbox flips, then holds.
+static void mode_fold(void) {
+  unsigned target = constrain(SEGMENT.intensity, 0, 100);
+  unsigned active = roundf(SEGLEN * target / 100.0f);
+
+  // restart the fold (record start time) on fresh init, or when the "Re-trigger" checkbox toggles
+  bool trig = SEGMENT.check3;
+  if (SEGENV.call == 0 || trig != (bool)(SEGENV.aux0 & 0x1)) SEGENV.step = strip.now;
+  SEGENV.aux0 = (SEGENV.aux0 & ~0x1) | (trig ? 0x1 : 0x0);
+
+  // time-based fold: speed 0 -> 20s (very slow), speed 255 -> 0.2s (snap). FPS-independent & smooth.
+  uint32_t dur = map(SEGMENT.speed, 0, 255, 20000, 200);
+  uint32_t elapsed = strip.now - SEGENV.step;
+  // fractional fill position -> the leading-edge LED fades in smoothly (per-LED brightness ramp)
+  float prog = (elapsed >= dur) ? (float)active : (float)active * elapsed / (float)dur;
+  unsigned full = (unsigned)prog;                  // fully-lit pixels behind the edge
+  uint8_t  edge = (uint8_t)((prog - full) * 255);  // 0..255 brightness of the growing tip LED
+  SEGENV.aux1 = full;                              // keep current progress visible to other code
+
+  bool fromTop = SEGMENT.check1;
+  for (unsigned i = 0; i < SEGLEN; i++) {
+    unsigned idx = fromTop ? (SEGLEN - 1 - i) : i;       // physical pixel for this fill step
+    uint32_t c = SEGMENT.check2 ? SEGCOLOR(0)            // solid primary
+                                : SEGMENT.color_from_palette(idx, true, PALETTE_SOLID_WRAP, 0);
+    if      (i < full)   SEGMENT.setPixelColor(idx, c);                              // fully lit
+    else if (i == full)  SEGMENT.setPixelColor(idx, color_blend(SEGCOLOR(1), c, edge)); // fading tip
+    else                 SEGMENT.setPixelColor(idx, SEGCOLOR(1));                    // background
+  }
+}
+static const char _data_FX_MODE_FOLD[] PROGMEM = "Fold@!,Fill %,,,,From top,Solid,Re-trigger;!,!;!;;sx=210,ix=90,o1=1,o2=1";
+
+// Fold Stagger: same fluid one-shot fold as Fold, but each segment waits (segment order x Stagger)
+// before igniting, so the bars cascade one after another. Same controls as Fold, plus:
+//   custom1 (Stagger) : delay added per segment in the order (0 = all together, like Fold)
+static void mode_fold_stagger(void) {
+  unsigned target = constrain(SEGMENT.intensity, 0, 100);
+  unsigned active = roundf(SEGLEN * target / 100.0f);
+
+  // restart on fresh init or Re-trigger toggle (records this segment's t0; segments init together)
+  bool trig = SEGMENT.check3;
+  if (SEGENV.call == 0 || trig != (bool)(SEGENV.aux0 & 0x1)) SEGENV.step = strip.now;
+  SEGENV.aux0 = (SEGENV.aux0 & ~0x1) | (trig ? 0x1 : 0x0);
+
+  uint32_t dur     = map(SEGMENT.speed,  0, 255, 20000, 200);  // fold duration
+  uint32_t stagger = map(SEGMENT.custom1, 0, 255, 0, 4000);    // per-segment delay step (ms)
+  uint32_t delay   = (uint32_t)strip.getCurrSegmentId() * stagger;
+
+  uint32_t t = strip.now - SEGENV.step;
+  float prog;
+  if (t <= delay) prog = 0.0f;                                 // still waiting its turn
+  else {
+    uint32_t e = t - delay;
+    prog = (e >= dur) ? (float)active : (float)active * e / (float)dur;
+  }
+  unsigned full = (unsigned)prog;
+  uint8_t  edge = (uint8_t)((prog - full) * 255);
+  SEGENV.aux1 = full;
+
+  bool fromTop = SEGMENT.check1;
+  for (unsigned i = 0; i < SEGLEN; i++) {
+    unsigned idx = fromTop ? (SEGLEN - 1 - i) : i;
+    uint32_t c = SEGMENT.check2 ? SEGCOLOR(0)
+                                : SEGMENT.color_from_palette(idx, true, PALETTE_SOLID_WRAP, 0);
+    if      (i < full)   SEGMENT.setPixelColor(idx, c);
+    else if (i == full)  SEGMENT.setPixelColor(idx, color_blend(SEGCOLOR(1), c, edge));
+    else                 SEGMENT.setPixelColor(idx, SEGCOLOR(1));
+  }
+}
+static const char _data_FX_MODE_FOLD_STAGGER[] PROGMEM = "Fold Stagger@!,Fill %,Stagger,,,From top,Solid,Re-trigger;!,!;!;;sx=210,ix=90,c1=128,o1=1,o2=1";
+
+// Fireworks Random: WLED's Fireworks 1D, but each segment waits a RANDOMIZED idle gap between bursts,
+// scaled by the Density slider. Lower density -> longer/varied gaps -> only a random subset of bars
+// is bursting at once (instead of every segment firing constantly = too busy). Per-segment, no coordination.
+typedef struct FwSpark { float pos, posX; float vel, velX; uint16_t col; uint8_t colIndex; } fwspark;
+
+static void mode_fireworks_random(void) {
+  if (SEGLEN <= 1) FX_FALLBACK_STATIC;
+  const int cols = SEGMENT.is2D() ? SEG_W : 1;
+  const int rows = SEGMENT.is2D() ? SEG_H : SEGLEN;
+
+  unsigned maxData = FAIR_DATA_PER_SEG;
+  unsigned segs = strip.getActiveSegmentsNum();
+  if (segs <= (strip.getMaxSegments() /2)) maxData *= 2;
+  if (segs <= (strip.getMaxSegments() /4)) maxData *= 2;
+  int maxSparks = maxData / sizeof(fwspark);
+
+  unsigned numSparks = min(5 + ((rows*cols) >> 1), maxSparks);
+  unsigned dataSize = sizeof(fwspark) * numSparks;
+  if (!SEGENV.allocateData(dataSize + sizeof(float))) FX_FALLBACK_STATIC;
+  float *dying_gravity = reinterpret_cast<float*>(SEGENV.data + dataSize);
+
+  if (dataSize != SEGENV.aux1) {
+    *dying_gravity = 0.0f;
+    SEGENV.aux0 = 0;
+    SEGENV.aux1 = dataSize;
+  }
+
+  SEGMENT.fade_out(252);
+
+  fwspark* sparks = reinterpret_cast<fwspark*>(SEGENV.data);
+  fwspark* flare = sparks;
+
+  float gravity = -0.0004f - (SEGMENT.speed/800000.0f);
+  gravity *= rows;
+
+  if (SEGENV.aux0 < 2) { // FLARE
+    if (SEGENV.aux0 == 0) {
+      flare->pos = 0;
+      flare->posX = SEGMENT.is2D() ? hw_random16(2,cols-3) : (SEGMENT.intensity > hw_random8());
+      unsigned peakHeight = 75 + hw_random8(180);
+      peakHeight = (peakHeight * (rows -1)) >> 8;
+      flare->vel = sqrtf(-2.0f * gravity * peakHeight);
+      flare->velX = SEGMENT.is2D() ? (hw_random8(9)-4)/64.0f : 0;
+      flare->col = 255;
+      SEGENV.aux0 = 1;
+    }
+    if (flare->vel > 12 * gravity) {
+      if (SEGMENT.is2D()) SEGMENT.setPixelColorXY(unsigned(flare->posX), rows - uint16_t(flare->pos) - 1, flare->col, flare->col, flare->col);
+      else                SEGMENT.setPixelColor((flare->posX > 0.0f) ? rows - int(flare->pos) - 1 : int(flare->pos), flare->col, flare->col, flare->col);
+      flare->pos  += flare->vel;
+      flare->pos  = constrain(flare->pos, 0, rows-1);
+      if (SEGMENT.is2D()) { flare->posX += flare->velX; flare->posX = constrain(flare->posX, 0, cols-1); }
+      flare->vel  += gravity;
+      flare->col  -= 2;
+    } else {
+      SEGENV.aux0 = 2;
+    }
+  } else if (SEGENV.aux0 < 4) {
+    unsigned nSparks = flare->pos + hw_random8(4);
+    nSparks = std::max(nSparks, 4U);
+    nSparks = std::min(nSparks, numSparks);
+    if (SEGENV.aux0 == 2) {
+      for (unsigned i = 1; i < nSparks; i++) {
+        sparks[i].pos  = flare->pos;
+        sparks[i].posX = flare->posX;
+        sparks[i].vel  = (float(hw_random16(20001)) / 10000.0f) - 0.9f;
+        sparks[i].vel *= rows<32 ? 0.5f : 1;
+        sparks[i].velX = SEGMENT.is2D() ? (float(hw_random16(20001)) / 10000.0f) - 1.0f : 0;
+        sparks[i].col  = 345;
+        sparks[i].colIndex = hw_random8();
+        sparks[i].vel  *= flare->pos/rows;
+        sparks[i].velX *= SEGMENT.is2D() ? flare->posX/cols : 0;
+        sparks[i].vel  *= -gravity *50;
+      }
+      *dying_gravity = gravity/2;
+      SEGENV.aux0 = 3;
+    }
+    if (sparks[1].col > 4) {
+      for (unsigned i = 1; i < nSparks; i++) {
+        sparks[i].pos  += sparks[i].vel;
+        sparks[i].posX += sparks[i].velX;
+        sparks[i].vel  += *dying_gravity;
+        sparks[i].velX += SEGMENT.is2D() ? *dying_gravity : 0;
+        if (sparks[i].col > 3) sparks[i].col -= 4;
+        if (sparks[i].pos > 0 && sparks[i].pos < rows) {
+          if (SEGMENT.is2D() && !(sparks[i].posX >= 0 && sparks[i].posX < cols)) continue;
+          unsigned prog = sparks[i].col;
+          uint32_t spColor = (SEGMENT.palette) ? SEGMENT.color_wheel(sparks[i].colIndex) : SEGCOLOR(0);
+          CRGBW c = BLACK;
+          if (prog > 300) {
+            c = color_blend(spColor, WHITE, uint8_t((prog - 300)*5));
+          } else if (prog > 45) {
+            c = color_blend(BLACK, spColor, uint8_t(prog - 45));
+            unsigned cooling = (300 - prog) >> 5;
+            c.g = qsub8(c.g, cooling);
+            c.b = qsub8(c.b, cooling * 2);
+          }
+          if (SEGMENT.is2D()) SEGMENT.setPixelColorXY(int(sparks[i].posX), rows - int(sparks[i].pos) - 1, c);
+          else                SEGMENT.setPixelColor(int(sparks[i].posX) ? rows - int(sparks[i].pos) - 1 : int(sparks[i].pos), c);
+        }
+      }
+      if (SEGMENT.check3) SEGMENT.blur(16);
+      *dying_gravity *= .8f;
+    } else {
+      // randomized idle gap (Density = custom1): lower density -> longer/varied waits -> fewer bars busy at once
+      unsigned idle = map(SEGMENT.custom1, 0, 255, 600, 0);
+      SEGENV.aux0 = 6 + hw_random8(10) + (idle ? hw_random16(idle) : 0);
+    }
+  } else {
+    SEGENV.aux0--;
+    if (SEGENV.aux0 < 4) SEGENV.aux0 = 0;
+  }
+}
+static const char _data_FX_MODE_FIREWORKS_RANDOM[] PROGMEM = "Fireworks Random@Gravity,Firing side,Density;!,!;!;12;pal=11,ix=128,c1=128";
+
 
 /////////////////////
 //  UserMod Class  //
@@ -1272,6 +1464,9 @@ class UserFxUsermod : public Usermod {
     strip.addEffect(255, &mode_2D_magma, _data_FX_MODE_2D_MAGMA);
     strip.addEffect(255, &mode_ants, _data_FX_MODE_ANTS);
     strip.addEffect(255, &mode_morsecode, _data_FX_MODE_MORSECODE);
+    strip.addEffect(255, &mode_fold, _data_FX_MODE_FOLD);
+    strip.addEffect(255, &mode_fold_stagger, _data_FX_MODE_FOLD_STAGGER);
+    strip.addEffect(255, &mode_fireworks_random, _data_FX_MODE_FIREWORKS_RANDOM);
 
     ////////////////////////////////////////
     //  add your effect function(s) here  //

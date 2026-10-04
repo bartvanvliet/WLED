@@ -122,6 +122,7 @@ void onHueData(void* arg, AsyncClient* client, void *data, size_t len)
         strlcpy(hueApiKey, apikey, sizeof(hueApiKey));
         hueAuthRequired = false;
         hueNewKey = true;
+        hueReceived = true; // ensure the freshly obtained API key gets saved in handleHue()
       }
     }
     return;
@@ -177,7 +178,9 @@ void onHueData(void* arg, AsyncClient* client, void *data, size_t len)
 
   hueError = HUE_ERROR_ACTIVE;
 
-  //apply vals
+  //apply vals -- only flag a state update (and thus a transition) when something ACTUALLY changed,
+  //otherwise fast polling re-triggers colorUpdated() every poll -> constant transitions -> FPS drops
+  bool hueChanged = false;
   if (hueBri != hueBriLast)
   {
     if (hueApplyOnOff)
@@ -190,17 +193,18 @@ void onHueData(void* arg, AsyncClient* client, void *data, size_t len)
       if (hueBri>0) bri = hueBri;
     }
     hueBriLast = hueBri;
+    hueChanged = true;
   }
   if (hueApplyColor)
   {
     switch(hueColormode)
     {
-      case 1: if (hueX != hueXLast || hueY != hueYLast) colorXYtoRGB(hueX,hueY,colPri); hueXLast = hueX; hueYLast = hueY; break;
-      case 2: if (hueHue != hueHueLast || hueSat != hueSatLast) colorHStoRGB(hueHue,hueSat,colPri); hueHueLast = hueHue; hueSatLast = hueSat; break;
-      case 3: if (hueCt != hueCtLast) colorCTtoRGB(hueCt,colPri); hueCtLast = hueCt; break;
+      case 1: if (hueX != hueXLast || hueY != hueYLast) { colorXYtoRGB(hueX,hueY,colPri); hueChanged = true; } hueXLast = hueX; hueYLast = hueY; break;
+      case 2: if (hueHue != hueHueLast || hueSat != hueSatLast) { colorHStoRGB(hueHue,hueSat,colPri); hueChanged = true; } hueHueLast = hueHue; hueSatLast = hueSat; break;
+      case 3: if (hueCt != hueCtLast) { colorCTtoRGB(hueCt,colPri); hueChanged = true; } hueCtLast = hueCt; break;
     }
   }
-  hueReceived = true;
+  if (hueChanged) hueReceived = true;
 }
 #else
 void handleHue(){}
